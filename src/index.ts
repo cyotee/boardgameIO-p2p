@@ -73,7 +73,7 @@ class BackoffScheduler {
   }
 }
 
-class P2PTransport extends Transport {
+class PeerJSP2PTransport extends Transport {
   private peer: Peer | null = null;
   private peerOptions: PeerJSOption;
   private onError: (error: PeerError) => void;
@@ -286,6 +286,29 @@ class P2PTransport extends Transport {
  * });
  */
 export const P2P =
-  (p2pOpts: P2POpts = {}): ((transportOpts: TransportOpts) => P2PTransport) =>
-  (transportOpts: TransportOpts): P2PTransport =>
-    new P2PTransport({ ...transportOpts, ...p2pOpts });
+  (p2pOpts: P2POpts = {}): ((transportOpts: TransportOpts) => PeerJSP2PTransport) =>
+  (transportOpts: TransportOpts): PeerJSP2PTransport =>
+    new PeerJSP2PTransport({ ...transportOpts, ...p2pOpts });
+
+// ---------------------------------------------------------------------------
+// Channel-based transport (ManaMesh join-code / injected WebRTC path)
+// ---------------------------------------------------------------------------
+export {
+  P2PTransport,
+  P2PMultiplayer,
+  BrowserStorage,
+  saveTimestreamsSession,
+  loadTimestreamsSession,
+  clearTimestreamsSession,
+  TIMESTREAMS_SESSION_KEY,
+} from "./channel-transport";
+export type {
+  P2PTransportOpts,
+  P2PRole,
+  P2PMessage,
+  P2PMessageType,
+  TimestreamsP2PSession,
+} from "./channel-transport";
+export type { P2PChannel, P2PChannelEvents, ConnectionState } from "./channel";
+export type { AssetSharingMessage, AssetSharingMessageType } from "./extension-messages";
+export { isAssetSharingMessage } from "./extension-messages";

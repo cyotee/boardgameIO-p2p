@@ -4,9 +4,11 @@
     "declarationMap": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
+    "lib": ["ES2019", "DOM"],
     "module": "CommonJS",
     "outDir": "dist",
     "strict": true,
-    "target": "es2015"
+    "target": "es2019",
+    "skipLibCheck": true
   }
 }

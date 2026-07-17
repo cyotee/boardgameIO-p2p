@@ -50,13 +50,13 @@ export class P2PHost {
     const filterPlayerView = getFilterPlayerView(game);
 
     this.master = new Master(game, this.db, {
-      send: ({ playerID, ...data }) => {
+      send: ({ playerID, ...data }: { playerID: string; [key: string]: any }) => {
         const playerView = filterPlayerView(playerID, data);
         for (const [client] of this.clients) {
           if (client.metadata.playerID === playerID) client.send(playerView);
         }
       },
-      sendAll: (data) => {
+      sendAll: (data: any) => {
         for (const [client] of this.clients) {
           const playerView = filterPlayerView(client.metadata.playerID, data);
           client.send(playerView);
