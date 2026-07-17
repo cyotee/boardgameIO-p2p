@@ -1,0 +1,59 @@
+name: Publish npm
+
+on:
+  push:
+    branches: [main, master, latest]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - run: npm ci || npm install
+      - run: npm i -D boardgame.io@0.50.2
+      - run: npm test
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm install -g npm@latest
+      - run: npm ci || npm install
+      - run: npm i -D boardgame.io@0.50.2
+      - run: npm run build
+      - name: Strip monorepo-only deps
+        run: |
+          node -e "
+            const fs=require('fs');
+            const j=JSON.parse(fs.readFileSync('package.json','utf8'));
+            if (j.devDependencies) delete j.devDependencies['boardgame.io'];
+            fs.writeFileSync('package.json', JSON.stringify(j,null,2)+'\n');
+          "
+      - name: Publish if new version
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
+        run: |
+          set -euo pipefail
+          NAME=$(node -p "require('./package.json').name")
+          VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "Already published $NAME@$VER"
+            exit 0
+          fi
+          npm publish --access public
