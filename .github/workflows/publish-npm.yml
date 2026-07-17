@@ -18,8 +18,12 @@ jobs:
         with:
           node-version: "22"
           package-manager-cache: false
-      - run: npm ci || npm install
-      - run: npm i -D boardgame.io@0.50.2
+      - name: Install
+        run: |
+          # Ensure no monorepo-only protocols remain
+          node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('package.json'));if(j.devDependencies){j.devDependencies['boardgame.io']='^0.50.2';fs.writeFileSync('package.json',JSON.stringify(j,null,2))}"
+          npm install
+          npm i -D boardgame.io@0.50.2
       - run: npm test
 
   publish:
@@ -33,19 +37,17 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - run: npm install -g npm@latest
-      - run: npm ci || npm install
-      - run: npm i -D boardgame.io@0.50.2
-      - run: npm run build
-      - name: Strip monorepo-only deps
+      - name: Install and build
         run: |
-          node -e "
-            const fs=require('fs');
-            const j=JSON.parse(fs.readFileSync('package.json','utf8'));
-            if (j.devDependencies) delete j.devDependencies['boardgame.io'];
-            fs.writeFileSync('package.json', JSON.stringify(j,null,2)+'\n');
-          "
+          node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('package.json'));if(j.devDependencies){j.devDependencies['boardgame.io']='^0.50.2';fs.writeFileSync('package.json',JSON.stringify(j,null,2))}"
+          npm install
+          npm i -D boardgame.io@0.50.2
+          npm run build
+          node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('package.json'));if(j.devDependencies)delete j.devDependencies['boardgame.io'];j.publishConfig={access:'public'};fs.writeFileSync('package.json',JSON.stringify(j,null,2))"
       - name: Publish if new version
         env:
+          # Leave unset for pure OIDC once Trusted Publisher is configured on npmjs.com
+          # Bootstrap: set repo secret NPM_TOKEN (granular write; may still need account 2FA policy fix)
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: "true"
         run: |
