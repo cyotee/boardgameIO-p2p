@@ -244,8 +244,20 @@ export type P2PRole = "host" | "guest";
 
 export interface P2PTransportOpts {
   game: Game;
-  /** Pre-established peer data channel (join-code WebRTC, LAN, etc.). */
-  connection: P2PChannel;
+  /**
+   * Pre-established peer data channel.
+   * - Guest: required (channel to host).
+   * - Host 2p legacy: single channel to the one guest.
+   * - Host multi-peer: omit and pass {@link hostConnections} instead
+   *   (or pass both — hostConnections takes precedence for fan-out).
+   */
+  connection?: P2PChannel;
+  /**
+   * Host only: one channel per guest boardgame.io playerID (`"1"`, `"2"`, …).
+   * When set, state updates are broadcast to every guest channel and
+   * inbound messages are demuxed per channel.
+   */
+  hostConnections?: Map<string, P2PChannel>;
   role: P2PRole;
   matchID?: string;
   playerID?: string;
@@ -301,7 +313,7 @@ function initializeGameState(
   const startingPhase = findStartingPhase(game);
 
   const playOrder = Array.from({ length: numPlayers }, (_, i) => String(i));
-  const ctx: Ctx = {
+  let ctx: Ctx = {
     numPlayers,
     playOrder,
     playOrderPos: 0,
@@ -319,11 +331,17 @@ function initializeGameState(
     ? (game.setup as any)({ ...ctx, playOrder }, setupData)
     : {};
 
-  // Run onBegin for the starting phase if present
+  // Run onBegin + activePlayers for the starting phase if present
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const phases = (game as any).phases;
-  if (startingPhase && phases?.[startingPhase]?.onBegin) {
-    phases[startingPhase].onBegin({ G, ctx });
+  if (startingPhase && phases?.[startingPhase]) {
+    if (phases[startingPhase].onBegin) {
+      phases[startingPhase].onBegin({ G, ctx });
+    }
+    const active = resolveActivePlayers(game, ctx, G);
+    if (active) {
+      ctx = { ...ctx, activePlayers: active as Ctx["activePlayers"] };
+    }
   }
 
   return {
@@ -337,14 +355,67 @@ function initializeGameState(
 }
 
 /**
- * Invoke phase onBegin when entering a new phase.
+ * Expand phase turn.activePlayers (e.g. `{ all: null }`) into a per-seat map
+ * boardgame.io clients understand (`{ "0": null, "1": null }`).
+ * Without this, P2P left activePlayers null forever and only currentPlayer
+ * looked "active" — concurrent decrypt / off-turn prompts break, and guests
+ * can miss that the turn advanced.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function resolveActivePlayers(
+  game: Game,
+  ctx: Ctx,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  G: any,
+): Record<string, null> | null {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const phases = (game as any).phases;
+  const phaseTurn = ctx.phase ? phases?.[ctx.phase]?.turn : undefined;
+  const ap = phaseTurn?.activePlayers ?? (game as any).turn?.activePlayers;
+  if (!ap) return null;
+
+  const playOrder: string[] =
+    (ctx.playOrder as string[]) ||
+    (G?.playerOrder as string[]) ||
+    Array.from({ length: ctx.numPlayers }, (_, i) => String(i));
+
+  // { all: Stage.NULL } / { all: null } → every seat active
+  if (Object.prototype.hasOwnProperty.call(ap, "all")) {
+    const stage = (ap as { all: null }).all;
+    const out: Record<string, null> = {};
+    for (const pid of playOrder) {
+      out[pid] = stage;
+    }
+    return out;
+  }
+
+  // { value: { "0": null, "1": null } } or plain map of seats
+  if (ap.value && typeof ap.value === "object") {
+    return { ...ap.value };
+  }
+  if (typeof ap === "object") {
+    return { ...ap };
+  }
+  return null;
+}
+
+/**
+ * Invoke phase onBegin when entering a new phase, and apply concurrent seats.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function runPhaseOnBegin(game: Game, G: any, ctx: Ctx): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const phases = (game as any).phases;
-  if (!ctx.phase || !phases?.[ctx.phase]?.onBegin) return;
-  phases[ctx.phase].onBegin({ G, ctx });
+  if (!ctx.phase || !phases?.[ctx.phase]) return;
+  const phaseConfig = phases[ctx.phase];
+  if (phaseConfig.onBegin) {
+    phaseConfig.onBegin({ G, ctx });
+  }
+  // Mutate ctx so callers that spread it pick up activePlayers.
+  const active = resolveActivePlayers(game, ctx, G);
+  if (active) {
+    (ctx as Ctx).activePlayers = active as Ctx["activePlayers"];
+  }
 }
 
 /**
@@ -588,13 +659,24 @@ function applyAction(
       playOrderPos: nextPos,
       currentPlayer: String(nextPid),
       numMoves: 0,
-      turn: ctx.turn + 1,
+      turn: (ctx.turn || 0) + 1,
     };
+    // Re-apply phase concurrent seats after turn change (boardgame.io does this;
+    // without it guests keep a stale null activePlayers and never look "active").
+    const active = resolveActivePlayers(game, newCtx, G);
+    if (active) {
+      newCtx = {
+        ...newCtx,
+        activePlayers: active as Ctx["activePlayers"],
+      };
+    }
     console.log(
       "[applyAction] endTurn → currentPlayer",
       newCtx.currentPlayer,
       "day",
       G.currentDay,
+      "activePlayers",
+      newCtx.activePlayers,
       "startOfDayPending was consumed by turn.order.next if set",
     );
   }
@@ -866,7 +948,10 @@ class P2PMaster {
  * Implements the Transport interface required by boardgame.io Client
  */
 export class P2PTransport {
-  private connection: P2PChannel;
+  /** Guest channel, or host 2p single-guest channel (legacy). */
+  private connection: P2PChannel | null;
+  /** Host multi-peer: playerID → guest channel. */
+  private hostConnections: Map<string, P2PChannel>;
   private role: P2PRole;
   private master: P2PMaster | null = null;
   private messageBuffer: P2PMessage[] = [];
@@ -892,7 +977,6 @@ export class P2PTransport {
   constructor(
     opts: P2PTransportOpts & { transportDataCallback?: TransportDataCallback },
   ) {
-    this.connection = opts.connection;
     this.role = opts.role;
     this.gameName = opts.game.name || "unknown";
     this.playerID = opts.playerID || null;
@@ -903,6 +987,38 @@ export class P2PTransport {
     this.setupData = opts.setupData;
     this.restoreFromPersist = !!opts.restoreFromPersist;
     this.transportDataCallback = opts.transportDataCallback || null;
+
+    // Normalize host multi-peer vs legacy single connection.
+    if (opts.hostConnections && opts.hostConnections.size > 0) {
+      this.hostConnections = new Map(opts.hostConnections);
+      this.connection = opts.connection ?? null;
+    } else if (opts.connection) {
+      this.connection = opts.connection;
+      this.hostConnections = new Map();
+      if (opts.role === "host") {
+        // Legacy 2p: treat single channel as guest "1".
+        this.hostConnections.set("1", opts.connection);
+      }
+    } else {
+      throw new Error(
+        "P2PTransport requires connection and/or hostConnections",
+      );
+    }
+  }
+
+  /** Guest playerIDs the host currently has channels for. */
+  private guestPlayerIDs(): string[] {
+    return Array.from(this.hostConnections.keys());
+  }
+
+  private anyGuestConnected(): boolean {
+    if (this.hostConnections.size === 0) {
+      return this.connection?.isConnected() ?? false;
+    }
+    for (const ch of this.hostConnections.values()) {
+      if (ch.isConnected()) return true;
+    }
+    return false;
   }
 
   get isConnected(): boolean {
@@ -944,12 +1060,16 @@ export class P2PTransport {
   }
 
   connect(): void {
-    // Set up message handler for the P2P connection
-    this.setupMessageHandler();
+    // Set up message handlers on all peer channels
+    this.setupMessageHandlers();
 
     // Reflect current connection state immediately.
     // Host initialization is async; connectivity should not depend on it.
-    this.setConnectionStatus(this.connection.isConnected());
+    const connected =
+      this.role === "host"
+        ? true // host master will run even if guests attach later
+        : (this.connection?.isConnected() ?? false);
+    this.setConnectionStatus(connected || this.anyGuestConnected());
 
     if (this.role === "host") {
       // connectAsHost is async, but connect() is called synchronously by boardgame.io
@@ -962,30 +1082,64 @@ export class P2PTransport {
     }
   }
 
-  private setupMessageHandler(): void {
-    const events = this.connection.events;
-    if (!events) {
-      console.error("[P2PTransport] Cannot access connection events");
-      return;
-    }
+  private setupMessageHandlers(): void {
+    const wired = new Set<P2PChannel>();
 
-    const originalOnMessage = events.onMessage;
-    events.onMessage = (data: string) => {
-      try {
-        const message: P2PMessage = JSON.parse(data);
-        this.handleMessage(message);
-      } catch (e) {
-        console.error("[P2PTransport] Failed to parse message:", e);
+    const wire = (channel: P2PChannel, defaultPlayerID?: string) => {
+      if (wired.has(channel)) return;
+      wired.add(channel);
+      const events = channel.events;
+      if (!events) {
+        console.error("[P2PTransport] Cannot access connection events");
+        return;
       }
-      // Forward to app handlers (lobby signals, etc.).
-      originalOnMessage(data);
+
+      const originalOnMessage = events.onMessage;
+      events.onMessage = (data: string) => {
+        try {
+          const message: P2PMessage = JSON.parse(data);
+          // Stamp guest playerID from channel map when host receives traffic
+          if (
+            this.role === "host" &&
+            defaultPlayerID &&
+            message.type === "action"
+          ) {
+            const args = message.args || [];
+            if (args[3] == null) {
+              message.args = [args[0], args[1], args[2], defaultPlayerID];
+            }
+          }
+          if (
+            this.role === "host" &&
+            defaultPlayerID &&
+            message.type === "sync-req"
+          ) {
+            const args = message.args || [];
+            if (args[1] == null) {
+              message.args = [args[0], defaultPlayerID, args[2], args[3]];
+            }
+          }
+          this.handleMessage(message, defaultPlayerID);
+        } catch (e) {
+          console.error("[P2PTransport] Failed to parse message:", e);
+        }
+        originalOnMessage(data);
+      };
+
+      const originalOnConnectionStateChange = events.onConnectionStateChange;
+      events.onConnectionStateChange = (state: ConnectionState) => {
+        this.handleConnectionStateChange(state);
+        originalOnConnectionStateChange(state);
+      };
     };
 
-    const originalOnConnectionStateChange = events.onConnectionStateChange;
-    events.onConnectionStateChange = (state: ConnectionState) => {
-      this.handleConnectionStateChange(state);
-      originalOnConnectionStateChange(state);
-    };
+    if (this.role === "host") {
+      for (const [playerID, ch] of this.hostConnections) {
+        wire(ch, playerID);
+      }
+    } else if (this.connection) {
+      wire(this.connection);
+    }
   }
 
   private handleConnectionStateChange(state: ConnectionState): void {
@@ -1027,28 +1181,34 @@ export class P2PTransport {
       this.notifyClient(data);
     });
 
-    // Subscribe guest player '1' proactively and send them state updates
-    // This ensures the guest receives updates even if their sync-req was missed
-    this.master.subscribe("1", (data) => {
-      console.log("[P2PTransport] Sending to guest:", data.type);
-      this.sendToGuest(data);
-    });
-    // Also subscribe 'remote' key for broadcasts
-    this.master.subscribe("remote", (data) => {
-      this.sendToGuest(data);
-    });
+    // Subscribe each guest playerID so master callbacks fan out per seat.
+    // Do not also subscribe "remote" — notifyAll would double-deliver updates.
+    for (const guestId of this.guestPlayerIDs()) {
+      this.master.subscribe(guestId, (data) => {
+        console.log(
+          "[P2PTransport] Sending to guest",
+          guestId,
+          ":",
+          data.type,
+        );
+        this.sendToGuest(data, guestId);
+      });
+    }
 
     this.setConnectionStatus(true);
 
     // Request initial sync for local client
     this.requestSync();
 
-    // Proactively send initial state to guest after a short delay
-    // This handles the case where guest's sync-req was received before our handler was ready
+    // Proactively sync each connected guest after a short delay
     setTimeout(() => {
-      if (this.master && this.connection.isConnected()) {
-        console.log("[P2PTransport] Proactively syncing guest");
-        this.master.onSync(this.matchID, "1", undefined, this.numPlayers);
+      if (!this.master) return;
+      for (const guestId of this.guestPlayerIDs()) {
+        const ch = this.hostConnections.get(guestId);
+        if (ch?.isConnected()) {
+          console.log("[P2PTransport] Proactively syncing guest", guestId);
+          this.master.onSync(this.matchID, guestId, undefined, this.numPlayers);
+        }
       }
     }, 100);
   }
@@ -1056,7 +1216,7 @@ export class P2PTransport {
   private connectAsGuest(): void {
     console.log("[P2PTransport] Connecting as guest");
 
-    if (this.connection.isConnected()) {
+    if (this.connection?.isConnected()) {
       this.setConnectionStatus(true);
       // Request sync from host
       this.sendToHost({
@@ -1066,7 +1226,7 @@ export class P2PTransport {
     }
   }
 
-  private handleMessage(message: P2PMessage): void {
+  private handleMessage(message: P2PMessage, fromPlayerID?: string): void {
     // Asset sharing messages are bidirectional — handle for both roles
     if (isAssetSharingMessage(message.type)) {
       this.handleAssetSharingMessage(message);
@@ -1074,19 +1234,22 @@ export class P2PTransport {
     }
 
     if (this.role === "host") {
-      this.handleHostMessage(message);
+      this.handleHostMessage(message, fromPlayerID);
     } else {
       this.handleGuestMessage(message);
     }
   }
 
-  private handleHostMessage(message: P2PMessage): void {
+  private handleHostMessage(
+    message: P2PMessage,
+    fromPlayerID?: string,
+  ): void {
     if (!this.master) return;
 
     switch (message.type) {
       case "action": {
         let [action, stateID, matchID, playerID] = message.args;
-        const pid = playerID || "1";
+        const pid = playerID || fromPlayerID || "1";
 
         // boardgame.io puts playerID on payload; also set top-level.
         if (action) {
@@ -1104,20 +1267,26 @@ export class P2PTransport {
           .onUpdate(action, stateID, matchID, pid)
           .then((result) => {
             if (result?.error) {
-              this.sendToGuest({ type: "error", args: [result.error] });
+              this.sendToGuest(
+                { type: "error", args: [result.error] },
+                pid,
+              );
             }
           });
         break;
       }
 
-      case "sync-req":
+      case "sync-req": {
         const [syncMatchID, syncPlayerID, syncCredentials, syncNumPlayers] =
           message.args;
         if (!this.master) return;
 
-        // Guest is already subscribed in connectAsHost, just handle the sync request
-        const guestId = syncPlayerID || "1";
+        const guestId = syncPlayerID || fromPlayerID || "1";
         console.log("[P2PTransport] Received sync-req from guest:", guestId);
+        // Ensure this guest is subscribed for targeted updates
+        if (!this.hostConnections.has(guestId) && this.connection) {
+          // Legacy: already on "1"
+        }
         this.master.onSync(
           syncMatchID,
           guestId,
@@ -1125,11 +1294,13 @@ export class P2PTransport {
           syncNumPlayers,
         );
         break;
+      }
 
-      case "chat":
+      case "chat": {
         const [chatMatchID, chatMessage] = message.args;
         this.master.onChatMessage(chatMatchID, chatMessage, this.credentials);
         break;
+      }
     }
   }
 
@@ -1158,22 +1329,43 @@ export class P2PTransport {
   }
 
   private sendToHost(message: P2PMessage): void {
-    this.send(message);
+    this.sendOnChannel(this.connection, message);
   }
 
-  private sendToGuest(message: P2PMessage): void {
-    this.send(message);
+  /** Send to one guest by playerID, or broadcast when playerID omitted. */
+  private sendToGuest(message: P2PMessage, playerID?: string): void {
+    if (playerID) {
+      const ch = this.hostConnections.get(playerID);
+      if (ch) {
+        this.sendOnChannel(ch, message);
+        return;
+      }
+    }
+    this.broadcastToGuests(message);
   }
 
-  private send(message: P2PMessage): void {
-    if (!this.connection.isConnected()) {
+  private broadcastToGuests(message: P2PMessage): void {
+    if (this.hostConnections.size === 0 && this.connection) {
+      this.sendOnChannel(this.connection, message);
+      return;
+    }
+    for (const ch of this.hostConnections.values()) {
+      this.sendOnChannel(ch, message);
+    }
+  }
+
+  private sendOnChannel(
+    channel: P2PChannel | null,
+    message: P2PMessage,
+  ): void {
+    if (!channel || !channel.isConnected()) {
       console.log("[P2PTransport] Buffering message while disconnected");
       this.messageBuffer.push(message);
       return;
     }
 
     try {
-      this.connection.send(JSON.stringify(message));
+      channel.send(JSON.stringify(message));
     } catch (e) {
       console.error("[P2PTransport] Failed to send message:", e);
       this.messageBuffer.push(message);
@@ -1190,7 +1382,11 @@ export class P2PTransport {
     this.messageBuffer = [];
 
     for (const message of messages) {
-      this.send(message);
+      if (this.role === "guest") {
+        this.sendToHost(message);
+      } else {
+        this.broadcastToGuests(message);
+      }
     }
   }
 
@@ -1227,7 +1423,11 @@ export class P2PTransport {
 
     this.reconnectTimeout = setTimeout(() => {
       // Check if WebRTC connection has recovered on its own
-      if (this.connection.isConnected()) {
+      const recovered =
+        this.role === "guest"
+          ? (this.connection?.isConnected() ?? false)
+          : this.anyGuestConnected();
+      if (recovered) {
         console.log("[P2PTransport] Connection recovered");
         this.setConnectionStatus(true);
         this.reconnectAttempts = 0;
@@ -1262,7 +1462,11 @@ export class P2PTransport {
 
     if (this.master) {
       this.master.unsubscribe(this.playerID || "0");
-      // Unsubscribe any remote players (guest playerID and 'remote' key)
+      // Unsubscribe every guest seat we subscribed (multi-peer + legacy "1")
+      for (const guestId of this.guestPlayerIDs()) {
+        this.master.unsubscribe(guestId);
+      }
+      // Legacy / defensive keys
       this.master.unsubscribe("1");
       this.master.unsubscribe("remote");
       this.master = null;
@@ -1376,9 +1580,17 @@ export class P2PTransport {
     return () => this.assetSharingCallbacks.delete(callback);
   }
 
-  /** Send an asset sharing message to the peer. */
+  /** Send an asset sharing message to the peer(s). */
   sendAssetSharingMessage(msg: AssetSharingMessage): void {
-    this.send({ type: msg.type as P2PMessageType, args: [msg] });
+    const message: P2PMessage = {
+      type: msg.type as P2PMessageType,
+      args: [msg],
+    };
+    if (this.role === "guest") {
+      this.sendToHost(message);
+    } else {
+      this.broadcastToGuests(message);
+    }
   }
 
   private handleAssetSharingMessage(message: P2PMessage): void {

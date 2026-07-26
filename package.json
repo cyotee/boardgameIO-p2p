@@ -33,6 +33,10 @@
     "./channel": {
       "types": "./dist/channel-transport.d.ts",
       "default": "./dist/channel-transport.js"
+    },
+    "./trystero": {
+      "types": "./dist/trystero/index.d.ts",
+      "default": "./dist/trystero/index.js"
     }
   },
   "files": [
@@ -59,7 +63,13 @@
     "tweetnacl-util": "^0.15.1"
   },
   "peerDependencies": {
-    "boardgame.io": ">=0.49.1"
+    "boardgame.io": ">=0.49.1",
+    "trystero": "^0.25.0"
+  },
+  "peerDependenciesMeta": {
+    "trystero": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/jest": "^27.0.2",
@@ -72,6 +82,7 @@
     "jest": "^27.3.1",
     "prettier": "^3.0.3",
     "standard-version": "^9.3.1",
+    "trystero": "0.25.3",
     "ts-jest": "^27.0.7",
     "typescript": "^4.4.3"
   }
