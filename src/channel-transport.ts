@@ -18,6 +18,7 @@ import type {
   LogEntry,
   Ctx,
 } from "boardgame.io";
+import { Transport } from "boardgame.io/internal";
 import { INVALID_MOVE } from "boardgame.io/core";
 import type { ConnectionState, P2PChannel } from "./channel";
 import {
@@ -269,13 +270,9 @@ export interface P2PTransportOpts {
   setupData?: unknown;
 }
 
-interface TransportDataCallback {
-  (data: {
-    type: "update" | "sync" | "matchData" | "chat" | "patch";
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    args: any[];
-  }): void;
-}
+type TransportOpts = ConstructorParameters<typeof Transport>[0];
+type TransportDataCallback = TransportOpts["transportDataCallback"];
+type TransportData = Parameters<TransportDataCallback>[0];
 
 interface ConnectionStatusCallback {
   (): void;
@@ -413,9 +410,7 @@ function runPhaseOnBegin(game: Game, G: any, ctx: Ctx): void {
   }
   // Mutate ctx so callers that spread it pick up activePlayers.
   const active = resolveActivePlayers(game, ctx, G);
-  if (active) {
-    (ctx as Ctx).activePlayers = active as Ctx["activePlayers"];
-  }
+  ctx.activePlayers = (active ?? null) as Ctx["activePlayers"];
 }
 
 /**
@@ -604,6 +599,7 @@ function applyAction(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const phaseConfig = (game.phases as any)[currentPhase as string];
     if (phaseConfig?.next) {
+      G = phaseConfig.onEnd?.({ G, ctx, events }) ?? G;
       const nextPhase =
         typeof phaseConfig.next === "function"
           ? phaseConfig.next({ G, ctx })
@@ -628,6 +624,7 @@ function applyAction(
     if (phaseConfig?.endIf) {
       const shouldEnd = phaseConfig.endIf({ G, ctx });
       if (shouldEnd && phaseConfig.next) {
+        G = phaseConfig.onEnd?.({ G, ctx, events }) ?? G;
         const nextPhase =
           typeof phaseConfig.next === "function"
             ? phaseConfig.next({ G, ctx })
@@ -780,6 +777,20 @@ class P2PMaster {
     });
   }
 
+  /** Filter every state snapshot before it crosses a seat boundary. */
+  private playerState(state: State<any>, playerID: string | null): State<any> {
+    const copy = JSON.parse(JSON.stringify(state));
+    if (this.game.playerView) {
+      copy.G = this.game.playerView({ G: copy.G, ctx: copy.ctx, playerID });
+    }
+    // History can contain earlier, unfiltered secrets. This transport does not
+    // implement undo or redacted move logs, so never expose those snapshots.
+    copy._undo = [];
+    copy._redo = [];
+    delete copy.deltalog;
+    return copy;
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async onUpdate(
     action: any,
@@ -845,9 +856,11 @@ class P2PMaster {
     await this.db.setState(matchID, newState);
 
     // Broadcast the update to all clients
-    this.notifyAll({
-      type: "update",
-      args: [matchID, newState, []],
+    this.subscribers.forEach((callback, seat) => {
+      callback({
+        type: "update",
+        args: [matchID, this.playerState(newState, seat), []],
+      });
     });
   }
 
@@ -892,10 +905,10 @@ class P2PMaster {
         args: [
           matchID,
           {
-            state,
-            initialState: initialState || state,
+            state: this.playerState(state, playerID),
+            initialState: this.playerState(initialState || state, playerID),
             filteredMetadata,
-            log: log || [],
+            log: [],
           },
         ],
       });
@@ -947,7 +960,8 @@ class P2PMaster {
  *
  * Implements the Transport interface required by boardgame.io Client
  */
-export class P2PTransport {
+export class P2PTransport extends Transport {
+  isConnected = false;
   /** Guest channel, or host 2p single-guest channel (legacy). */
   private connection: P2PChannel | null;
   /** Host multi-peer: playerID → guest channel. */
@@ -958,25 +972,23 @@ export class P2PTransport {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
-  private _isConnected = false;
   private connectionStatusCallbacks: Set<ConnectionStatusCallback> = new Set();
 
   // Properties expected by boardgame.io Client
-  private gameName: string;
-  private playerID: string | null;
-  private matchID: string;
-  private credentials?: string;
-  private numPlayers: number;
   private game: Game;
   private setupData?: unknown;
   private restoreFromPersist: boolean;
-  private transportDataCallback: TransportDataCallback | null = null;
   private assetSharingCallbacks: Set<(msg: AssetSharingMessage) => void> =
     new Set();
 
   constructor(
     opts: P2PTransportOpts & { transportDataCallback?: TransportDataCallback },
   ) {
+    super({
+      ...opts,
+      gameName: opts.game.name || "unknown",
+      transportDataCallback: opts.transportDataCallback ?? (() => {}),
+    });
     this.role = opts.role;
     this.gameName = opts.game.name || "unknown";
     this.playerID = opts.playerID || null;
@@ -986,7 +998,6 @@ export class P2PTransport {
     this.game = opts.game;
     this.setupData = opts.setupData;
     this.restoreFromPersist = !!opts.restoreFromPersist;
-    this.transportDataCallback = opts.transportDataCallback || null;
 
     // Normalize host multi-peer vs legacy single connection.
     if (opts.hostConnections && opts.hostConnections.size > 0) {
@@ -1021,42 +1032,22 @@ export class P2PTransport {
     return false;
   }
 
-  get isConnected(): boolean {
-    return this._isConnected;
-  }
-
   subscribeToConnectionStatus(fn: ConnectionStatusCallback): () => void {
     this.connectionStatusCallbacks.add(fn);
     return () => this.connectionStatusCallbacks.delete(fn);
   }
 
-  private setConnectionStatus(connected: boolean): void {
-    if (this._isConnected !== connected) {
-      this._isConnected = connected;
+  protected setConnectionStatus(connected: boolean): void {
+    if (this.isConnected !== connected) {
+      this.isConnected = connected;
       this.connectionStatusCallbacks.forEach((fn) => fn());
     }
   }
 
-  private notifyClient(data: P2PMessage): void {
-    console.log(
-      "[P2PTransport] notifyClient called with type:",
-      data.type,
-      "callback:",
-      this.transportDataCallback ? "present" : "null",
-    );
-    if (this.transportDataCallback) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      this.transportDataCallback(
-        data as {
-          type: "update" | "sync" | "matchData" | "chat" | "patch";
-          args: any[];
-        },
-      );
-    } else {
-      console.warn(
-        "[P2PTransport] transportDataCallback is null, cannot notify client",
-      );
-    }
+  protected notifyClient(data: P2PMessage): void {
+    // Only engine response messages reach this boundary; extension messages
+    // are routed separately by handleMessage.
+    super.notifyClient(data as TransportData);
   }
 
   connect(): void {
@@ -1245,11 +1236,23 @@ export class P2PTransport {
     fromPlayerID?: string,
   ): void {
     if (!this.master) return;
+    if (!fromPlayerID || !this.hostConnections.has(fromPlayerID)) return;
+    if (!Array.isArray(message.args)) return;
 
     switch (message.type) {
       case "action": {
         let [action, stateID, matchID, playerID] = message.args;
-        const pid = playerID || fromPlayerID || "1";
+        const pid = fromPlayerID;
+        // A seat belongs to its connection, never to a field in guest input.
+        if (
+          (playerID != null && playerID !== pid) ||
+          (action?.playerID != null && action.playerID !== pid) ||
+          (action?.payload?.playerID != null && action.payload.playerID !== pid)
+        ) {
+          this.sendToGuest({ type: "error", args: ["Player ID mismatch"] }, pid);
+          return;
+        }
+        if (!action || action.type !== "MAKE_MOVE" || !action.payload) return;
 
         // boardgame.io puts playerID on payload; also set top-level.
         if (action) {
@@ -1281,7 +1284,11 @@ export class P2PTransport {
           message.args;
         if (!this.master) return;
 
-        const guestId = syncPlayerID || fromPlayerID || "1";
+        const guestId = fromPlayerID;
+        if (syncPlayerID != null && syncPlayerID !== guestId) {
+          this.sendToGuest({ type: "error", args: ["Player ID mismatch"] }, guestId);
+          return;
+        }
         console.log("[P2PTransport] Received sync-req from guest:", guestId);
         // Ensure this guest is subscribed for targeted updates
         if (!this.hostConnections.has(guestId) && this.connection) {
@@ -1605,10 +1612,7 @@ export class P2PTransport {
  */
 export function P2PMultiplayer(opts: Omit<P2PTransportOpts, "game">) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (transportOpts: {
-    game: Game;
-    transportDataCallback: TransportDataCallback;
-  }) => {
+  return (transportOpts: TransportOpts) => {
     return new P2PTransport({
       ...opts,
       game: transportOpts.game,
